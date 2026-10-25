@@ -14,6 +14,7 @@ import time
 import uuid
 import hashlib
 import logging
+import requests
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import JSONResponse
@@ -76,6 +77,64 @@ def format_traceparent(trace_id: str, span_id: str) -> str:
 # ---------------------------------------------------------------------------
 # AI Diagnosis Engine (Deterministic Fallback + Optional API Call)
 # ---------------------------------------------------------------------------
+def call_llm_diagnosis(incident: Dict[str, Any], allowed_causes: List[str]) -> Optional[Dict[str, Any]]:
+    gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    model_name = os.environ.get("MODEL_NAME", "gemini-1.5-flash")
+    
+    prompt = (
+        f"You are an SRE incident triage agent.\n"
+        f"Incident Title: {incident.get('title')}\n"
+        f"Service: {incident.get('service')}\n"
+        f"Allowed Root Causes: {json.dumps(allowed_causes)}\n"
+        f"Transcript:\n{incident.get('transcript', '')[:4000]}\n\n"
+        f"Task:\n"
+        f"1. Choose EXACTLY ONE rootCause from Allowed Root Causes.\n"
+        f"2. Cite between 2 and 4 evidence IDs from the transcript (e.g. ['ev_101', 'ev_102']).\n"
+        f"Return ONLY a JSON object with keys: 'rootCause' (string) and 'evidence' (list of strings)."
+    )
+    
+    if gemini_key:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"}
+            }
+            res = requests.post(url, json=payload, timeout=8)
+            if res.status_code == 200:
+                txt = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                data = json.loads(txt)
+                rc = data.get("rootCause")
+                ev = data.get("evidence", [])
+                if rc in allowed_causes and 2 <= len(ev) <= 4:
+                    return {"rootCause": rc, "evidence": ev}
+        except Exception as e:
+            logger.warning(f"Gemini API call failed, using fallback: {e}")
+            
+    elif openai_key:
+        try:
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {openai_key}"}
+            payload = {
+                "model": os.environ.get("MODEL_NAME", "gpt-4o-mini"),
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"}
+            }
+            res = requests.post(url, headers=headers, json=payload, timeout=8)
+            if res.status_code == 200:
+                data = json.loads(res.json()["choices"][0]["message"]["content"])
+                rc = data.get("rootCause")
+                ev = data.get("evidence", [])
+                if rc in allowed_causes and 2 <= len(ev) <= 4:
+                    return {"rootCause": rc, "evidence": ev}
+        except Exception as e:
+            logger.warning(f"OpenAI API call failed, using fallback: {e}")
+            
+    return None
+
+
 def diagnose_incident(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Finds the root cause, cites 2-4 evidence IDs, and picks minimal diagnostic calls.
@@ -85,46 +144,51 @@ def diagnose_incident(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any
     allowed = incident.get("allowedRootCauses", [])
     service = incident.get("service", "unknown-service")
     
-    # 1. Extract all evidence-tagged lines: [ev_...] text
-    evidence_matches = re.findall(r'\[(ev_[a-zA-Z0-9_\-]+)\](.*?)(?=\[ev_|\Z)', transcript, re.DOTALL)
-    evidence_map = {}
-    for ev_id, text in evidence_matches:
-        evidence_map[ev_id] = text.strip()
+    # Optional LLM call if API keys exist
+    llm_res = call_llm_diagnosis(incident, allowed)
+    if llm_res:
+        chosen_cause = llm_res["rootCause"]
+        chosen_evs = llm_res["evidence"]
+    else:
+        # 1. Extract all evidence-tagged lines: [ev_...] text
+        evidence_matches = re.findall(r'\[(ev_[a-zA-Z0-9_\-]+)\](.*?)(?=\[ev_|\Z)', transcript, re.DOTALL)
+        evidence_map = {}
+        for ev_id, text in evidence_matches:
+            evidence_map[ev_id] = text.strip()
 
-    # 2. Select matching root cause based on keyword occurrences
-    chosen_cause = allowed[0] if allowed else "unknown_error"
-    best_score = -1
-    evidence_scores = {}
+        # 2. Select matching root cause based on keyword occurrences
+        chosen_cause = allowed[0] if allowed else "unknown_error"
+        best_score = -1
+        evidence_scores = {}
 
-    for cause in allowed:
-        cause_keywords = [w.lower() for w in re.split(r'[_ -]', cause) if len(w) > 2]
-        score = 0
-        matching_evs = []
-        for ev_id, text in evidence_map.items():
-            t_lower = text.lower()
-            m = sum(1 for kw in cause_keywords if kw in t_lower)
-            if m > 0:
-                score += m
-                matching_evs.append(ev_id)
-        if score > best_score:
-            best_score = score
-            chosen_cause = cause
-            evidence_scores[cause] = matching_evs
+        for cause in allowed:
+            cause_keywords = [w.lower() for w in re.split(r'[_ -]', cause) if len(w) > 2]
+            score = 0
+            matching_evs = []
+            for ev_id, text in evidence_map.items():
+                t_lower = text.lower()
+                m = sum(1 for kw in cause_keywords if kw in t_lower)
+                if m > 0:
+                    score += m
+                    matching_evs.append(ev_id)
+            if score > best_score:
+                best_score = score
+                chosen_cause = cause
+                evidence_scores[cause] = matching_evs
 
-    # Select 2 to 4 evidence IDs
-    matched_evs = evidence_scores.get(chosen_cause, [])
-    all_evs = list(evidence_map.keys())
-    if len(matched_evs) < 2:
-        # Pad with other available evidence IDs to ensure between 2 and 4
-        for ev in all_evs:
-            if ev not in matched_evs:
-                matched_evs.append(ev)
-            if len(matched_evs) >= 3:
-                break
-    chosen_evs = matched_evs[:min(4, max(2, len(matched_evs)))]
+        # Select 2 to 4 evidence IDs
+        matched_evs = evidence_scores.get(chosen_cause, [])
+        all_evs = list(evidence_map.keys())
+        if len(matched_evs) < 2:
+            # Pad with other available evidence IDs to ensure between 2 and 4
+            for ev in all_evs:
+                if ev not in matched_evs:
+                    matched_evs.append(ev)
+                if len(matched_evs) >= 3:
+                    break
+        chosen_evs = matched_evs[:min(4, max(2, len(matched_evs)))]
 
     # 3. Choose minimal diagnostic calls from toolCatalog (1 to 3 tools)
-    # Filter catalog for diagnostic tools
     diag_tools = [t for t in tool_catalog if "query" in t.get("name", "").lower() or "check" in t.get("name", "").lower() or "inspect" in t.get("name", "").lower() or "log" in t.get("name", "").lower() or "metric" in t.get("name", "").lower()]
     if not diag_tools:
         diag_tools = tool_catalog[:1]
@@ -499,7 +563,7 @@ async def post_incident(request: Request):
         "chosen_effect": None,
         "suppressed": [],
         "approval_info": None,
-        "model_name": "gemini-1.5-flash"
+        "model_name": os.environ.get("MODEL_NAME", "gemini-1.5-flash")
     }
 
     logger.info(f"Initialized run {run_id} with {len(dispatches)} diagnostic dispatches.")
@@ -862,4 +926,5 @@ async def get_incident(run_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
